@@ -17,9 +17,9 @@
       provisioning are implemented by OSAC-5017.
       Tiers: {{ _provider_tiers | default([]) | map(attribute='name') | list }}
 
-# The dispatcher does not clear this fact between providers, so leaving it unset
-# would make a mixed-provider tenant accumulate the previous provider's config
-# under the 'pure' key.
+# The dispatcher nulls this fact before each dispatch, and storage_provider's
+# setup.yaml fails the run if a dispatched provider leaves it null — so even a
+# placeholder has to declare a config.
 - name: Set empty tenant config output
   ansible.builtin.set_fact:
     storage_provider_tenant_config: {}

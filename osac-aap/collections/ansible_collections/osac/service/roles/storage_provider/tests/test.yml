@@ -1307,3 +1307,59 @@
               Dispatching provider 'pure' failed -- the dispatcher no longer
               resolves osac.templates.pure_storage:
               {{ ansible_failed_result.msg | default('unknown error') }}
+
+# ──────────────────────────────────────────────────────────────
+# Test 30: dispatch clears stale per-provider output facts (OSAC-5016)
+# Expected: _dispatch_provider.yaml resets storage_provider_tenant_config and
+#   storage_provider_storage_class_names before each include_role, so a provider
+#   that sets neither cannot inherit the previous loop iteration's values.
+#   Uses teardown_cluster_storage because that action's provider roles set no
+#   output facts, which isolates the reset from anything the role itself writes.
+#   Without the reset this play ends with the seeded values still in scope.
+# ──────────────────────────────────────────────────────────────
+- name: Test storage_provider -- dispatch clears stale provider output facts (OSAC-5016)
+  hosts: localhost
+  gather_facts: false
+
+  tasks:
+    - name: Run stale-output-fact reset test
+      block:
+        - name: Seed output facts as if an earlier provider had set them
+          ansible.builtin.set_fact:
+            storage_provider_tenant_config:
+              leaked_from: "a-previous-provider"
+            storage_provider_storage_class_names:
+              - name: leaked-storage-class
+
+        - name: Dispatch an action whose provider role sets no output facts
+          ansible.builtin.include_role:
+            name: osac.service.storage_provider
+          vars:
+            storage_provider_tiers:
+              - name: pure-standard
+                protocol: nfs
+                provider: pure
+                backend_id: be-pure-test
+            storage_provider_action: teardown_cluster_storage
+            storage_provider_csi_backends_enabled: false
+            tenant_name: "tenant-acme"
+            tenant_namespace: "osac-tenants"
+
+        - name: Verify both facts were cleared before the provider role ran
+          ansible.builtin.assert:
+            that:
+              - storage_provider_tenant_config is none
+              - storage_provider_storage_class_names == []
+            fail_msg: >-
+              _dispatch_provider.yaml did not reset per-provider output facts, so
+              a provider that sets none inherits the previous provider's values:
+              tenant_config={{ storage_provider_tenant_config | default('undefined') }}
+              sc_names={{ storage_provider_storage_class_names | default('undefined') }}
+            success_msg: "Stale provider output facts are cleared before each dispatch"
+
+      rescue:
+        - name: Fail the test with the dispatch error
+          ansible.builtin.fail:
+            msg: >-
+              teardown_cluster_storage dispatch for provider 'pure' failed:
+              {{ ansible_failed_result.msg | default('unknown error') }}

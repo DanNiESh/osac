@@ -15,9 +15,9 @@
       StorageClass creation are implemented by OSAC-5018.
       Tiers: {{ _provider_tiers | default([]) | map(attribute='name') | list }}
 
-# The dispatcher does not clear this fact between providers, so leaving it unset
-# would make a mixed-provider tenant re-append the previous provider's
-# StorageClass names.
+# The dispatcher already resets this to [] before each dispatch, so this is
+# belt-and-braces — it keeps the output contract visible in the placeholder
+# rather than relying on the caller's reset.
 - name: Set empty StorageClass names output
   ansible.builtin.set_fact:
     storage_provider_storage_class_names: []
