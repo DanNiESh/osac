@@ -42,6 +42,10 @@ var _ = Describe("Version", func() {
 
 	BeforeEach(func() {
 		ctx = context.Background()
+		// Cluster creates may inherit a persisted tenant-default subnet, which
+		// requires the deployment's canonical networking Hub to be available.
+		getOrCreateTenantDefaultNetworkClassFixture(ctx)
+
 		clustersClient = publicv1.NewClustersClient(tool.ExternalView().UserConn())
 		instanceTypesClient = privatev1.NewBareMetalInstanceTypesClient(tool.InternalView().AdminConn())
 		templatesClient = privatev1.NewClusterTemplatesClient(tool.InternalView().AdminConn())
@@ -54,7 +58,7 @@ var _ = Describe("Version", func() {
 				}.Build(),
 				Spec: privatev1.BareMetalInstanceTypeSpec_builder{
 					Hardware: privatev1.BareMetalHardwareSpec_builder{
-						Cpu:    privatev1.BareMetalCPUSpec_builder{Cores: 32, Architecture: "x86_64", ThreadsPerCore: 2}.Build(),
+						Cpu:    privatev1.BareMetalCPUSpec_builder{Cores: 32, Architecture: "amd64", ThreadsPerCore: 2}.Build(),
 						Memory: privatev1.BareMetalMemorySpec_builder{TotalGb: 128}.Build(),
 						NetworkPorts: []*privatev1.BareMetalNetworkPortSpec{
 							privatev1.BareMetalNetworkPortSpec_builder{

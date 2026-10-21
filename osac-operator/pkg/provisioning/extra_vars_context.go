@@ -31,6 +31,9 @@ const (
 	storageBackendConnectionsKey
 	networkAttachmentMACsKey
 	subnetParentVirtualNetworkKey
+	aapExtraVarsKey
+	addOnOperatorNameKey
+	externalIPPoolKey
 )
 
 // TierDefinition is the flat, AAP-schema-shaped representation of a storage tier
@@ -85,6 +88,26 @@ func SubnetParentVirtualNetworkFromContext(ctx context.Context) SubnetParentVirt
 	return parent
 }
 
+// ExternalIPPoolContext carries the pool identity selected for an ExternalIP job.
+type ExternalIPPoolContext struct {
+	FulfillmentID string
+	KubernetesUID string
+	TenantID      string
+	CIDR          string
+	Phase         string
+}
+
+// WithExternalIPPool returns a context carrying the selected ExternalIPPool.
+func WithExternalIPPool(ctx context.Context, pool ExternalIPPoolContext) context.Context {
+	return context.WithValue(ctx, externalIPPoolKey, pool)
+}
+
+// ExternalIPPoolFromContext retrieves the selected ExternalIPPool or its zero value.
+func ExternalIPPoolFromContext(ctx context.Context) ExternalIPPoolContext {
+	pool, _ := ctx.Value(externalIPPoolKey).(ExternalIPPoolContext)
+	return pool
+}
+
 // WithTenantStorageClasses returns a context carrying the tenant's resolved
 // storage classes. The AAP provider reads this when building extra_vars.
 func WithTenantStorageClasses(ctx context.Context, scs []v1alpha1.ResolvedStorageClass) context.Context {
@@ -109,6 +132,19 @@ func WithAdminKubeconfig(ctx context.Context, kubeconfig string) context.Context
 func AdminKubeconfigFromContext(ctx context.Context) string {
 	kc, _ := ctx.Value(adminKubeconfigKey).(string)
 	return kc
+}
+
+// WithAddOnOperatorName returns a context carrying the operator role name for
+// an add-on installation AAP job.
+func WithAddOnOperatorName(ctx context.Context, name string) context.Context {
+	return context.WithValue(ctx, addOnOperatorNameKey, name)
+}
+
+// AddOnOperatorNameFromContext retrieves the operator role name for an
+// add-on installation AAP job, or an empty string if it is not set.
+func AddOnOperatorNameFromContext(ctx context.Context) string {
+	name, _ := ctx.Value(addOnOperatorNameKey).(string)
+	return name
 }
 
 // WithStorageTierDefinitions returns a context carrying the resolved storage tier
@@ -150,4 +186,16 @@ func WithNetworkAttachmentMACs(ctx context.Context, macs map[string]string) cont
 func NetworkAttachmentMACsFromContext(ctx context.Context) map[string]string {
 	macs, _ := ctx.Value(networkAttachmentMACsKey).(map[string]string)
 	return macs
+}
+
+// WithAAPExtraVars returns a context carrying additional top-level AAP extra
+// variables. The AAP provider merges these with its standard osac_job_vars.
+func WithAAPExtraVars(ctx context.Context, extraVars map[string]any) context.Context {
+	return context.WithValue(ctx, aapExtraVarsKey, extraVars)
+}
+
+// AAPExtraVarsFromContext retrieves additional top-level AAP extra variables.
+func AAPExtraVarsFromContext(ctx context.Context) map[string]any {
+	extraVars, _ := ctx.Value(aapExtraVarsKey).(map[string]any)
+	return extraVars
 }

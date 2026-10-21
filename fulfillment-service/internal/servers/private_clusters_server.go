@@ -57,6 +57,7 @@ type PrivateClustersServer struct {
 	templatesDao              *dao.GenericDAO[*privatev1.ClusterTemplate]
 	catalogItemsDao           *dao.GenericDAO[*privatev1.ClusterCatalogItem]
 	clusterVersionsDao        *dao.GenericDAO[*privatev1.ClusterVersion]
+	networkClassesDao         *dao.GenericDAO[*privatev1.NetworkClass]
 	subnetsDao                *dao.GenericDAO[*privatev1.Subnet]
 	securityGroupsDao         *dao.GenericDAO[*privatev1.SecurityGroup]
 	externalIPPoolDao         *dao.GenericDAO[*privatev1.ExternalIPPool]
@@ -118,6 +119,10 @@ func (b *PrivateClustersServerBuilder) Build() (result *PrivateClustersServer, e
 	}
 	if b.tenancyLogic == nil {
 		err = errors.New("tenancy logic is mandatory")
+		return
+	}
+	networkClassesDao, err := newNetworkClassesDAO(b.logger, b.tenancyLogic, b.metricsRegisterer)
+	if err != nil {
 		return
 	}
 	// Create the templates DAO:
@@ -260,6 +265,7 @@ func (b *PrivateClustersServerBuilder) Build() (result *PrivateClustersServer, e
 		catalogItemsDao:           catalogItemsDao,
 		bareMetalInstanceTypesDao: bareMetalInstanceTypesDao,
 		clusterVersionsDao:        clusterVersionsDao,
+		networkClassesDao:         networkClassesDao,
 		subnetsDao:                subnetsDao,
 		securityGroupsDao:         securityGroupsDao,
 		externalIPPoolDao:         externalIPPoolDao,
@@ -339,6 +345,9 @@ func (s *PrivateClustersServer) prepareCreate(ctx context.Context, candidate *pr
 	if err != nil {
 		return
 	}
+	if err := s.validateCreatedNodeSetVersions(ctx, candidate); err != nil {
+		return err
+	}
 	if key := spec.GetSshPublicKey(); key != "" {
 		if err = validateOpenSSHPublicKey(key); err != nil {
 			return grpcstatus.Errorf(grpccodes.InvalidArgument, "spec.ssh_public_key: %s", err)
@@ -394,115 +403,129 @@ func (s *PrivateClustersServer) resolveCreationSource(ctx context.Context,
 
 func (s *PrivateClustersServer) Update(ctx context.Context,
 	request *privatev1.ClustersUpdateRequest) (response *privatev1.ClustersUpdateResponse, err error) {
-	err = s.validateNoDuplicateConditions(request.GetObject())
-	if err != nil {
+	if err = s.validateNoDuplicateConditions(request.GetObject()); err != nil {
 		return
 	}
-	err = s.validateClusterStateForSpecUpdate(ctx, request)
-	if err != nil {
+	if err = s.validateClusterStateForSpecUpdate(ctx, request); err != nil {
 		return
 	}
-	// Legacy upgrade validation may normalize version; never mutate the caller's request.
+	// Version validation canonicalizes selected references; keep the caller's request intact.
 	request = proto.Clone(request).(*privatev1.ClustersUpdateRequest)
-	err = s.validateVersionUpdate(ctx, request)
-	if err != nil {
+	if err = s.validateClusterUpdateRequest(ctx, request); err != nil {
 		return
 	}
-	err = s.validateNodeSetsUpdate(ctx, request)
-	if err != nil {
-		return
-	}
-	err = s.validateAutoExternalIPImmutability(ctx, request)
-	if err != nil {
-		return
-	}
-	err = s.validateSpecUpdateRequest(request)
-	if err != nil {
-		return
-	}
-
-	err = s.generic.UpdateWithCandidatePreparation(ctx, request, &response, func(ctx context.Context, current *privatev1.Cluster, candidate *privatev1.Cluster) error {
-		if err := validateClusterEndpointAddresses(candidate.GetStatus(), request.GetUpdateMask()); err != nil {
-			return err
-		}
-		if err := validateClusterNetworkAttachmentImmutability(current, candidate, request.GetUpdateMask()); err != nil {
-			return err
-		}
-		if err := validateClusterTemplateImmutability(current, candidate, request.GetUpdateMask()); err != nil {
-			return err
-		}
-		mask := request.GetUpdateMask()
-		sizeOnlyNodeSets := len(mask.GetPaths()) > 0 && s.isUpdatingOnlySizes(mask)
-		if err := s.prepareUpdatedClusterNodeSets(ctx, current, candidate, mask, sizeOnlyNodeSets); err != nil {
-			return err
-		}
-		if updateIncludesField(mask, "spec.ssh_public_key") {
-			if key := candidate.GetSpec().GetSshPublicKey(); key != "" {
-				if err := validateOpenSSHPublicKey(key); err != nil {
-					return grpcstatus.Errorf(grpccodes.InvalidArgument, "spec.ssh_public_key: %s", err)
-				}
-			}
-		}
-		if err := s.validateAddOnOperatorImmutability(current, candidate, mask); err != nil {
-			return err
-		}
-		if err := utils.ValidateClusterSpecFields(candidate.GetSpec()); err != nil {
-			return err
-		}
-		// An explicit size-only update keeps the existing hardware type and fabric interface.
-		// Re-resolving here would prevent scaling legacy clusters with tenant-scoped BMITs.
-		if s.updateAffectsNodeSets(mask) && candidate.GetSpec().GetNetworkAttachment() != nil && !sizeOnlyNodeSets {
-			if err := s.resolveFabricInterfaces(ctx, candidate); err != nil {
-				return err
-			}
-		}
-		if updateIncludesField(request.GetUpdateMask(), "spec.network_attachment.security_groups") {
-			if err := s.validateNetworkAttachmentState(ctx, candidate); err != nil {
-				return err
-			}
-		}
-		if !proto.Equal(current.GetSpec().GetPullSecretSecret(), candidate.GetSpec().GetPullSecretSecret()) {
-			ref := candidate.GetSpec().GetPullSecretSecret()
-			allowShared := ref.GetId() != "" && ref.GetId() == current.GetSpec().GetPullSecretSecret().GetId()
-			if err := s.validatePullSecretSecret(ctx, candidate, allowShared); err != nil {
-				return err
-			}
-		}
-		return nil
+	err = s.generic.UpdateWithCandidatePreparation(ctx, request, &response, func(ctx context.Context,
+		current, candidate *privatev1.Cluster) error {
+		return s.prepareUpdatedCluster(ctx, current, candidate, request)
 	})
 	return
 }
 
-// prepareUpdatedClusterNodeSets retains resolved metadata for unchanged NodeSets and
-// validates new hardware selections against the shared CaaS type scope.
+func (s *PrivateClustersServer) validateClusterUpdateRequest(ctx context.Context,
+	request *privatev1.ClustersUpdateRequest) error {
+	if err := s.validateVersionUpdate(ctx, request); err != nil {
+		return err
+	}
+	if err := s.validateNodeSetsUpdate(ctx, request); err != nil {
+		return err
+	}
+	if err := s.validateAutoExternalIPImmutability(ctx, request); err != nil {
+		return err
+	}
+	return s.validateSpecUpdateRequest(request)
+}
+
+func (s *PrivateClustersServer) prepareUpdatedCluster(ctx context.Context, current, candidate *privatev1.Cluster,
+	request *privatev1.ClustersUpdateRequest) error {
+	if err := validateClusterEndpointAddresses(candidate.GetStatus(), request.GetUpdateMask()); err != nil {
+		return err
+	}
+	if err := validateClusterNetworkAttachmentImmutability(current, candidate, request.GetUpdateMask()); err != nil {
+		return err
+	}
+	if err := validateClusterTemplateImmutability(current, candidate, request.GetUpdateMask()); err != nil {
+		return err
+	}
+	mask := request.GetUpdateMask()
+	sizeOnlyNodeSets := len(mask.GetPaths()) > 0 && s.isUpdatingOnlySizes(mask)
+	if err := s.prepareUpdatedClusterNodeSets(ctx, current, candidate,
+		request.GetObject().GetSpec().GetNodeSets(), mask, sizeOnlyNodeSets); err != nil {
+		return err
+	}
+	if err := prepareClusterVersionChange(current, candidate, mask); err != nil {
+		return err
+	}
+	if err := s.validateUpdatedClusterSpec(current, candidate, mask); err != nil {
+		return err
+	}
+	return s.prepareUpdatedClusterReferences(ctx, current, candidate, mask, sizeOnlyNodeSets)
+}
+
+func (s *PrivateClustersServer) validateUpdatedClusterSpec(current, candidate *privatev1.Cluster,
+	mask *fieldmaskpb.FieldMask) error {
+	if updateIncludesField(mask, "spec.ssh_public_key") {
+		if key := candidate.GetSpec().GetSshPublicKey(); key != "" {
+			if err := validateOpenSSHPublicKey(key); err != nil {
+				return grpcstatus.Errorf(grpccodes.InvalidArgument, "spec.ssh_public_key: %s", err)
+			}
+		}
+	}
+	if err := s.validateAddOnOperatorImmutability(current, candidate, mask); err != nil {
+		return err
+	}
+	if err := utils.ValidateClusterSpecFields(candidate.GetSpec()); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (s *PrivateClustersServer) prepareUpdatedClusterReferences(ctx context.Context,
+	current, candidate *privatev1.Cluster, mask *fieldmaskpb.FieldMask, sizeOnlyNodeSets bool) error {
+	// An explicit size-only update keeps the existing hardware type and fabric interface.
+	// Re-resolving here would prevent scaling legacy clusters with tenant-scoped BMITs.
+	if s.updateAffectsNodeSets(mask) && candidate.GetSpec().GetNetworkAttachment() != nil && !sizeOnlyNodeSets {
+		if err := s.resolveFabricInterfaces(ctx, candidate); err != nil {
+			return err
+		}
+	}
+	if updateIncludesField(mask, "spec.network_attachment.security_groups") {
+		if err := s.validateNetworkAttachmentState(ctx, candidate); err != nil {
+			return err
+		}
+	}
+	if !proto.Equal(current.GetSpec().GetPullSecretSecret(), candidate.GetSpec().GetPullSecretSecret()) {
+		ref := candidate.GetSpec().GetPullSecretSecret()
+		allowShared := ref.GetId() != "" && ref.GetId() == current.GetSpec().GetPullSecretSecret().GetId()
+		if err := s.validatePullSecretSecret(ctx, candidate, allowShared); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// prepareUpdatedClusterNodeSets preserves stored fields for nested node-set
+// updates and checks that newly selected hardware types are not being deleted.
 func (s *PrivateClustersServer) prepareUpdatedClusterNodeSets(
-	ctx context.Context, current, candidate *privatev1.Cluster, mask *fieldmaskpb.FieldMask, sizeOnlyNodeSets bool,
+	ctx context.Context, current, candidate *privatev1.Cluster,
+	requestedNodeSets map[string]*privatev1.ClusterNodeSet, mask *fieldmaskpb.FieldMask, sizeOnlyNodeSets bool,
 ) error {
 	if !s.updateAffectsNodeSets(mask) {
 		return nil
 	}
+	partialSizeOrVersionUpdate := isUpdatingOnlyNodeSizeOrVersionFields(mask) && !sizeOnlyNodeSets
 	for name, nodeSet := range candidate.GetSpec().GetNodeSets() {
 		existing := current.GetSpec().GetNodeSets()[name]
-		if sizeOnlyNodeSets && existing == nil {
-			return grpcstatus.Errorf(grpccodes.InvalidArgument,
-				"node_sets.%s.baremetal_instance_type is required when adding a node set with a size-only update", name)
-		}
-		if existing != nil &&
-			(refKey(existing.GetBaremetalInstanceType()) == refKey(nodeSet.GetBaremetalInstanceType()) ||
-				(s.isUpdatingOnlySizes(mask) && refKey(nodeSet.GetBaremetalInstanceType()) == "")) {
-			// Nested map masks replace the entire NodeSet message, so size-only updates
-			// must restore both server-owned fields from the persisted NodeSet.
-			nodeSet.SetBaremetalInstanceType(cloneMessage(existing.GetBaremetalInstanceType()))
-			if sizeOnlyNodeSets {
-				nodeSet.SetFabricInterface(existing.GetFabricInterface())
-			}
-			continue
-		}
-		if key := refKey(nodeSet.GetBaremetalInstanceType()); key != "" {
-			if _, err := resolveCaaSBareMetalInstanceType(ctx, s.bareMetalInstanceTypesDao, candidate.GetMetadata(),
-				nodeSet.GetBaremetalInstanceType(), "node_sets."+name+".baremetal_instance_type", false); err != nil {
+		if partialSizeOrVersionUpdate {
+			var err error
+			nodeSet, err = restoreMaskedNodeSetFields(name, existing, requestedNodeSets[name], mask)
+			if err != nil {
 				return err
 			}
+			candidate.GetSpec().GetNodeSets()[name] = nodeSet
+		}
+		retainOmittedNodeSetVersion(current.GetSpec().GetVersion(), existing, nodeSet)
+		if err := s.prepareUpdatedNodeSetHardware(ctx, name, existing, nodeSet, mask, sizeOnlyNodeSets); err != nil {
+			return err
 		}
 	}
 	return nil
@@ -630,31 +653,11 @@ func (s *PrivateClustersServer) validatePullSecretSecret(
 		privatev1.SecretType_SECRET_TYPE_PULL_SECRET)
 }
 
-// clusterUsesBareMetalWorkers reports whether the effective Cluster spec selects a bare-metal instance type.
-func clusterUsesBareMetalWorkers(cluster *privatev1.Cluster) bool {
-	for _, nodeSet := range cluster.GetSpec().GetNodeSets() {
-		if nodeSet != nil && refKey(nodeSet.GetBaremetalInstanceType()) != "" {
-			return true
-		}
-	}
-	return false
-}
-
-func validateClusterVersionDiskImageForBareMetal(version *privatev1.ClusterVersion) error {
-	if refKey(version.GetSpec().GetDiskImage()) == "" {
-		return grpcstatus.Errorf(grpccodes.FailedPrecondition,
-			"cluster version '%s' does not have a disk image attached, which is required for bare-metal workers",
-			version.GetMetadata().GetName())
-	}
-	return nil
-}
-
 // ensureClusterVersion makes sure the cluster spec has a usable version reference: if the user didn't provide one, it
-// resolves the system default. BM clusters require the selected ClusterVersion to reference a DiskImage.
+// resolves the system default.
 func (s *PrivateClustersServer) ensureClusterVersion(
 	ctx context.Context,
 	cluster *privatev1.Cluster,
-	requireDiskImage bool,
 ) (*privatev1.ClusterVersion, error) {
 	versionRef := cluster.GetSpec().GetVersion()
 	if versionRef != nil {
@@ -665,14 +668,9 @@ func (s *PrivateClustersServer) ensureClusterVersion(
 		if err := validateResolvedClusterVersion(version, version.GetMetadata().GetName(), ""); err != nil {
 			return nil, err
 		}
-		if requireDiskImage {
-			if err := validateClusterVersionDiskImageForBareMetal(version); err != nil {
-				return nil, err
-			}
-		}
 		return version, nil
 	}
-	version, err := resolveDefaultClusterVersion(ctx, s.logger, s.clusterVersionsDao, requireDiskImage)
+	version, err := resolveDefaultClusterVersion(ctx, s.logger, s.clusterVersionsDao)
 	if err != nil {
 		return nil, err
 	}
@@ -710,8 +708,10 @@ func (s *PrivateClustersServer) validateNodeSetsUpdate(ctx context.Context,
 		return nil
 	}
 
-	// Check if only size fields are being updated - these are always allowed
-	if s.isUpdatingOnlySizes(request.GetUpdateMask()) {
+	// Full-object updates and nested size/version masks are checked against the
+	// prepared candidate instead of treating a partial node-set map as a replacement.
+	if s.isUpdatingOnlySizes(request.GetUpdateMask()) ||
+		isUpdatingOnlyNodeSizeOrVersionFields(request.GetUpdateMask()) {
 		return nil
 	}
 
@@ -813,14 +813,19 @@ func (s *PrivateClustersServer) updateAffectsNodeSets(updateMask *fieldmaskpb.Fi
 
 // isUpdatingOnlySizes checks if the update mask is only modifying size fields of node sets.
 func (s *PrivateClustersServer) isUpdatingOnlySizes(updateMask *fieldmaskpb.FieldMask) bool {
+	if len(updateMask.GetPaths()) == 0 {
+		return true
+	}
+	hasSize := false
 	for _, path := range updateMask.GetPaths() {
-		if strings.HasPrefix(path, "spec.node_sets") {
+		if path == "spec" || strings.HasPrefix(path, "spec.node_sets") {
 			if !strings.HasSuffix(path, ".size") {
 				return false
 			}
+			hasSize = true
 		}
 	}
-	return true
+	return hasSize
 }
 
 // validateAtLeastOneNodeSet ensures that clusters always have at least one node set.
@@ -971,40 +976,6 @@ func (s *PrivateClustersServer) validateAddOnOperatorImmutability(
 	return nil
 }
 
-// validateVersionUpdate ensures version stays valid on update. Absent
-// version is normalized to the existing value (cannot be cleared once set).
-// Changed values are validated the same way as Create via ensureClusterVersion.
-func (s *PrivateClustersServer) validateVersionUpdate(ctx context.Context,
-	request *privatev1.ClustersUpdateRequest) error {
-	if !updateIncludesField(request.GetUpdateMask(), "spec.version") {
-		return nil
-	}
-	newSpec := request.GetObject().GetSpec()
-	if newSpec == nil {
-		return nil
-	}
-	existing, found, err := s.getExistingCluster(ctx, request)
-	if err != nil || !found {
-		return err
-	}
-	newRef := newSpec.GetVersion()
-	existingRef := existing.GetSpec().GetVersion()
-	if newRef == nil || (newRef.GetName() == "" && newRef.GetId() == "") {
-		if existingRef != nil {
-			newSpec.SetVersion(existingRef)
-		}
-		return nil
-	}
-	if existingRef != nil && newRef.GetName() == existingRef.GetName() {
-		return nil
-	}
-	version, err := resolveAndCanonicalizeReference(ctx, s.clusterVersionsDao, existing.GetMetadata(), newRef, "version", grpccodes.InvalidArgument)
-	if err != nil {
-		return err
-	}
-	return validateResolvedClusterVersion(version, version.GetMetadata().GetName(), "")
-}
-
 // validateClusterNetworkAttachmentImmutability rejects changes to the complete
 // network attachment after applying the update mask.
 func validateClusterNetworkAttachmentImmutability(current, candidate *privatev1.Cluster,
@@ -1123,6 +1094,11 @@ func (s *PrivateClustersServer) validateNetworkAttachmentState(ctx context.Conte
 	if err := validateResolvedSubnetReady(subnet, subnetKey, " in spec.network_attachment"); err != nil {
 		return err
 	}
+	hubReferences := []networkingHubReference{{
+		resourceType: "Subnet",
+		id:           subnet.GetId(),
+		hubID:        subnet.GetStatus().GetHub(),
+	}}
 
 	virtualNetworkID := refKey(subnet.GetSpec().GetVirtualNetwork())
 	if virtualNetworkID == "" {
@@ -1151,9 +1127,18 @@ func (s *PrivateClustersServer) validateNetworkAttachmentState(ctx context.Conte
 			fmt.Sprintf(" in spec.network_attachment.security_groups[%d]", i), virtualNetworkID); err != nil {
 			return err
 		}
+		hubReferences = append(hubReferences, networkingHubReference{
+			resourceType: "SecurityGroup",
+			id:           sg.GetId(),
+			hubID:        sg.GetStatus().GetHub(),
+		})
 	}
 
-	return nil
+	canonicalHubID, err := canonicalNetworkingHubID(ctx, s.logger, s.networkClassesDao)
+	if err != nil {
+		return err
+	}
+	return validateNetworkingHubReferences(canonicalHubID, hubReferences...)
 }
 
 // validateAutoExternalIPImmutability prevents changing auto_external_ip_attachment after creation.
@@ -1181,15 +1166,19 @@ func (s *PrivateClustersServer) validateAutoExternalIPImmutability(ctx context.C
 }
 
 // resolveFabricInterfaces populates fabric_interface on each node set by
-// resolving its canonical BareMetalInstanceType reference and selecting the first interface with role "fabric".
+// loading its BareMetalInstanceType by the already-resolved ID and selecting the first interface with role "fabric".
 func (s *PrivateClustersServer) resolveFabricInterfaces(ctx context.Context, cluster *privatev1.Cluster) error {
 	for name, nodeSet := range cluster.GetSpec().GetNodeSets() {
 		if refKey(nodeSet.GetBaremetalInstanceType()) == "" {
 			continue
 		}
-		bmit, err := resolveCaaSBareMetalInstanceType(ctx, s.bareMetalInstanceTypesDao, cluster.GetMetadata(),
-			nodeSet.GetBaremetalInstanceType(), "node_sets."+name+".baremetal_instance_type", false)
+		ref := nodeSet.GetBaremetalInstanceType()
+		kind := "node_sets." + name + ".baremetal_instance_type"
+		bmit, err := getReferenceResource(ctx, s.bareMetalInstanceTypesDao, ref.GetId())
 		if err != nil {
+			return resourceLookupError(err, kind, ref.GetId(), "", grpccodes.InvalidArgument)
+		}
+		if err := validateResourceNotDeleted(kind, refKey(ref), "", bmit.GetMetadata()); err != nil {
 			return err
 		}
 		fabricInterface, err := selectClusterFabricInterface(bmit)
@@ -1333,7 +1322,7 @@ func (s *PrivateClustersServer) applyClusterTemplate(
 		return nil, err
 	}
 
-	clusterVersion, err := s.ensureClusterVersion(ctx, cluster, clusterUsesBareMetalWorkers(cluster))
+	clusterVersion, err := s.ensureClusterVersion(ctx, cluster)
 	if err != nil {
 		return nil, err
 	}
@@ -1347,22 +1336,28 @@ func (s *PrivateClustersServer) applyClusterTemplate(
 		return nil, err
 	}
 
-	// Store the template reference with both ID and name. NodeSet hardware references were
-	// canonicalized in resolveClusterNodeSets, so metering can use their names.
+	// Store the template reference with both ID and name. NodeSet hardware references
+	// already have their IDs and names from the interceptor or Catalog Item authoring.
 	cluster.GetSpec().SetTemplate(canonicalClusterTemplateReference(template))
 
 	return clusterVersion, nil
 }
 
-// resolveClusterNodeSets validates and canonicalizes the effective Cluster NodeSets after
-// Catalog Item policies have been applied. Templates do not supply hardware selections.
+// resolveClusterNodeSets validates the effective Cluster NodeSets after Catalog Item
+// policies have been applied. References are already resolved by the interceptor or
+// Catalog Item authoring; only the hardware types' current deletion state is checked here.
 func (s *PrivateClustersServer) resolveClusterNodeSets(ctx context.Context, cluster *privatev1.Cluster) error {
 	if err := validateClusterNodeSetMap(cluster.GetSpec().GetNodeSets()); err != nil {
 		return grpcstatus.Errorf(grpccodes.InvalidArgument, "node_sets: %s", err)
 	}
 	for name, nodeSet := range cluster.GetSpec().GetNodeSets() {
-		if _, err := resolveCaaSBareMetalInstanceType(ctx, s.bareMetalInstanceTypesDao, cluster.GetMetadata(),
-			nodeSet.GetBaremetalInstanceType(), "node_sets."+name+".baremetal_instance_type", false); err != nil {
+		ref := nodeSet.GetBaremetalInstanceType()
+		kind := "node_sets." + name + ".baremetal_instance_type"
+		resolved, err := getReferenceResource(ctx, s.bareMetalInstanceTypesDao, ref.GetId())
+		if err != nil {
+			return resourceLookupError(err, kind, ref.GetId(), "", grpccodes.InvalidArgument)
+		}
+		if err := validateResourceNotDeleted(kind, refKey(ref), "", resolved.GetMetadata()); err != nil {
 			return err
 		}
 	}
@@ -1372,40 +1367,6 @@ func (s *PrivateClustersServer) resolveClusterNodeSets(ctx context.Context, clus
 // resolveCatalogItem finds the Cluster's published Catalog Item in the selected tenant/project
 // or shared scope, then finds the item's Template under the item's ownership. It applies locked
 // and editable field and parameter rules and returns that Template for defaults.
-func resolveCaaSBareMetalInstanceType(
-	ctx context.Context,
-	instanceTypes *dao.GenericDAO[*privatev1.BareMetalInstanceType],
-	ownerMetadata *privatev1.Metadata,
-	ref *privatev1.BareMetalInstanceTypeReference,
-	kind string,
-	lockTarget bool,
-) (*privatev1.BareMetalInstanceType, error) {
-	if ref == nil {
-		return nil, grpcstatus.Errorf(grpccodes.InvalidArgument, "%s reference is mandatory", kind)
-	}
-
-	// Cluster NodeSets and Catalog Item policies select hardware only; callers cannot
-	// select a tenant-scoped BMIT by omitting or changing the reference scope.
-	ref.SetShared(true)
-	var (
-		resolved *privatev1.BareMetalInstanceType
-		err      error
-	)
-	if lockTarget {
-		resolved, err = resolveAndCanonicalizeLockedReference(ctx, instanceTypes, ownerMetadata, ref, kind, grpccodes.InvalidArgument)
-	} else {
-		resolved, err = resolveAndCanonicalizeReference(ctx, instanceTypes, ownerMetadata, ref, kind, grpccodes.InvalidArgument)
-	}
-	if err != nil {
-		return nil, err
-	}
-	if resolved.GetMetadata().GetTenant() != auth.SharedTenant {
-		return nil, grpcstatus.Errorf(grpccodes.InvalidArgument,
-			"%s must reference a bare metal instance type in the shared tenant", kind)
-	}
-	return resolved, nil
-}
-
 func (s *PrivateClustersServer) resolveCatalogItem(ctx context.Context,
 	cluster *privatev1.Cluster) (*privatev1.ClusterTemplate, error) {
 	if cluster == nil {
