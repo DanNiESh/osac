@@ -1,15 +1,88 @@
 ---
-# Placeholder. Real cluster-side cleanup lands with OSAC-5022.
+# Pure Storage cluster-side teardown: remove StorageClasses and CSI Secret only.
 #
 # Receives from the dispatcher:
 #   _provider_tiers                — tiers with provider: pure
 #   _provider_backend_connections  — connection details for those tiers' backend_ids
 #
 # Sets no output fact — the dispatcher reads nothing back from this action.
+#
+# Deletes:
+#   - StorageClasses for this tenant
+#   - pure.json CSI credentials Secret
+#
+# Does NOT delete:
+#   - Backend resources (filesystems) — use teardown_backend for those
+#   - CSI driver operator or node plugin
+#   - Hub Secrets
 
-- name: Report that pure_storage teardown_cluster_storage is not yet implemented
-  ansible.builtin.debug:
-    msg: >-
-      pure_storage teardown_cluster_storage is a placeholder — cluster-side
-      cleanup is implemented by OSAC-5022.
-      Tiers: {{ _provider_tiers | default([]) | map(attribute='name') | list }}
+- name: Validate tenant_name is a valid DNS label
+  ansible.builtin.fail:
+    msg: "tenant_name '{{ tenant_name }}' is not a valid DNS label."
+  when: tenant_name is not regex('^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$')
+
+- name: Clean up cluster-side K8s resources
+  block:
+    - name: Find all tenant StorageClasses by label
+      kubernetes.core.k8s_info:
+        api_version: storage.k8s.io/v1
+        kind: StorageClass
+        label_selectors:
+          - "osac.openshift.io/tenant={{ tenant_name }}"
+          - "app.kubernetes.io/managed-by=osac-aap"
+      register: _pure_cleanup_sc_list
+
+    - name: Check for PVCs using tenant StorageClasses
+      when: _pure_cleanup_sc_list.resources | length > 0
+      kubernetes.core.k8s_info:
+        api_version: v1
+        kind: PersistentVolumeClaim
+      register: _pure_cleanup_pvc_list
+
+    - name: Find PVCs that reference tenant StorageClasses
+      when: _pure_cleanup_pvc_list.resources is defined
+      ansible.builtin.set_fact:
+        _pure_blocking_pvcs: >-
+          {{ _pure_cleanup_pvc_list.resources
+             | default([])
+             | selectattr('spec.storageClassName', 'defined')
+             | selectattr('spec.storageClassName', 'in', _pure_cleanup_sc_list.resources | map(attribute='metadata.name') | list)
+             | map(attribute='metadata.name')
+             | list }}
+
+    - name: Fail if PVCs still reference tenant StorageClasses
+      when:
+        - _pure_blocking_pvcs is defined
+        - _pure_blocking_pvcs | length > 0
+      ansible.builtin.fail:
+        msg: >-
+          Cannot delete StorageClasses for tenant {{ tenant_name }} — {{ _pure_blocking_pvcs | length }}
+          PVC(s) still reference them: {{ _pure_blocking_pvcs | join(', ') }}.
+          Delete the PVCs first.
+
+    - name: Delete tenant StorageClasses
+      kubernetes.core.k8s:
+        state: absent
+        api_version: storage.k8s.io/v1
+        kind: StorageClass
+        name: "{{ item.metadata.name }}"
+      loop: "{{ _pure_cleanup_sc_list.resources | default([]) }}"
+      loop_control:
+        label: "{{ item.metadata.name }}"
+      ignore_errors: true  # noqa: ignore-errors
+
+    - name: Delete CSI credentials Secret
+      kubernetes.core.k8s:
+        state: absent
+        api_version: v1
+        kind: Secret
+        name: "{{ pure_storage_csi_credential_secret_name }}"
+        namespace: "{{ pure_storage_csi_backends_namespace }}"
+      ignore_errors: true  # noqa: ignore-errors
+
+    - name: Report successful cluster-side teardown
+      ansible.builtin.debug:
+        msg: >-
+          Cluster-side teardown complete for tenant {{ tenant_name }}.
+          StorageClasses deleted: {{ _pure_cleanup_sc_list.resources | default([]) | map(attribute='metadata.name') | list }}
+          CSI Secret deleted: {{ pure_storage_csi_credential_secret_name }}

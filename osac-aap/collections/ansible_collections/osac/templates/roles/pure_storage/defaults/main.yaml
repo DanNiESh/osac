@@ -1,8 +1,9 @@
 ---
 # Pure-specific defaults — all use pure_storage_ prefix.
 
-# CSI provisioner name — OSAC CSI driver (vendor controllers run on hub)
-pure_storage_csi_provisioner: "osac.csi.openshift.io"
+# CSI provisioner name — native Portworx Pure CSI driver for POC
+# (upstream PSO, not the OSAC shim)
+pure_storage_csi_provisioner: "pure-csi"
 
 # Hub Secret prefix for per-tenant Pure config
 pure_storage_tenant_config_secret_prefix: "pure-tenant-config-"

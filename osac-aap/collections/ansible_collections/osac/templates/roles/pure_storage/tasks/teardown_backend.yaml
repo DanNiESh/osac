@@ -1,15 +1,91 @@
 ---
-# Placeholder. Real backend cleanup and Realm release land with OSAC-5022.
+# Pure Storage FlashBlade backend teardown.
 #
 # Receives from the dispatcher:
 #   _provider_tiers                — tiers with provider: pure
 #   _provider_backend_connections  — connection details for those tiers' backend_ids
 #
 # Sets no output fact — the dispatcher reads nothing back from this action.
+#
+# Deletes:
+#   - Tenant NFS filesystems on the FlashBlade array
+#   - Tenant config hub Secret (releases the Realm claim)
+#
+# Does NOT delete:
+#   - The Realm itself
+#   - NFS server (<realm>::nfs-server)
+#   - Export policies (<realm>::export-policy, <realm>::export-policy-tls)
+#   - Data VIP, Realm DNS, S3 account, TLS policy
+#   - Realm-scoped API token
+#   - Realm credential hub Secret (pure-realm-<realm>)
 
-- name: Report that pure_storage teardown_backend is not yet implemented
+- name: Validate tenant_name is a valid DNS label
+  ansible.builtin.fail:
+    msg: "tenant_name '{{ tenant_name }}' is not a valid DNS label."
+  when: tenant_name is not regex('^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$')
+
+- name: Read tenant config Secret from hub cluster
+  kubernetes.core.k8s_info:
+    api_version: v1
+    kind: Secret
+    name: "{{ pure_storage_tenant_config_secret_prefix }}{{ tenant_name }}"
+    namespace: "{{ pure_storage_config_namespace }}"
+  register: _pure_teardown_config
+  no_log: true
+  failed_when: false
+
+- name: Extract Realm credentials from tenant config Secret
+  when:
+    - _pure_teardown_config.resources | length > 0
+    - _pure_teardown_config.resources[0].data.realm_name is defined
+    - _pure_teardown_config.resources[0].data.api_token is defined
+    - _pure_teardown_config.resources[0].data.mgmt_endpoint is defined
+  ansible.builtin.set_fact:
+    _teardown_realm_name: "{{ _pure_teardown_config.resources[0].data.realm_name | b64decode }}"
+    _teardown_api_token: "{{ _pure_teardown_config.resources[0].data.api_token | b64decode }}"
+    _teardown_mgmt_endpoint: "{{ _pure_teardown_config.resources[0].data.mgmt_endpoint | b64decode }}"
+  no_log: true
+
+- name: Clean up FlashBlade filesystems
+  when:
+    - _teardown_realm_name is defined
+    - _teardown_api_token is defined
+    - _teardown_mgmt_endpoint is defined
+    - _provider_tiers | default([]) | length > 0
+  block:
+    - name: Delete tenant filesystems from the FlashBlade array
+      purestorage.flashblade.purefb_fs:
+        name: "{{ tenant_name }}-{{ item.name }}"
+        realm: "{{ _teardown_realm_name }}"
+        state: absent
+        fb_url: "{{ _teardown_mgmt_endpoint }}"
+        api_token: "{{ _teardown_api_token }}"
+        disable_warnings: "{{ not (pure_storage_validate_certs | bool) }}"
+      loop: "{{ _provider_tiers }}"
+      loop_control:
+        label: "{{ tenant_name }}-{{ item.name }}"
+      ignore_errors: true  # noqa: ignore-errors
+      no_log: true
+
+  always:
+    - name: Clear FlashBlade credentials from facts
+      ansible.builtin.set_fact:
+        _teardown_realm_name: null
+        _teardown_api_token: null
+        _teardown_mgmt_endpoint: null
+
+- name: Delete tenant config Secret from hub cluster
+  when: _pure_teardown_config.resources | length > 0
+  kubernetes.core.k8s:
+    state: absent
+    api_version: v1
+    kind: Secret
+    name: "{{ pure_storage_tenant_config_secret_prefix }}{{ tenant_name }}"
+    namespace: "{{ pure_storage_config_namespace }}"
+
+- name: Report successful teardown
   ansible.builtin.debug:
     msg: >-
-      pure_storage teardown_backend is a placeholder — FlashBlade cleanup and
-      Realm release are implemented by OSAC-5022.
-      Tiers: {{ _provider_tiers | default([]) | map(attribute='name') | list }}
+      Teardown complete for tenant {{ tenant_name }}.
+      Filesystems deleted: {{ _provider_tiers | default([]) | map(attribute='name') | map('regex_replace', '^', tenant_name ~ '-') | list }}
+      Realm claim released.

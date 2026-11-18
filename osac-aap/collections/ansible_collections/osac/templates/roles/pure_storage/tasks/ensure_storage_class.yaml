@@ -1,5 +1,5 @@
 ---
-# Placeholder. Real CSI credential and StorageClass creation lands with OSAC-5018.
+# Pure Storage FlashBlade StorageClass creation for native Portworx CSI.
 #
 # Refuses loudly rather than returning an empty StorageClass list. The
 # dispatcher already resets storage_provider_storage_class_names to [] before
@@ -12,10 +12,136 @@
 #   _provider_tiers                — tiers with provider: pure
 #   _provider_backend_connections  — connection details for those tiers' backend_ids
 
-- name: Fail because pure_storage ensure_storage_class is not yet implemented
-  ansible.builtin.fail:
-    msg: >-
-      pure_storage ensure_storage_class is not yet implemented, see OSAC-5018
-      (CSI credential and StorageClass creation); Realm checkout and FlashBlade
-      provisioning land with OSAC-5017.
-      Tiers: {{ _provider_tiers | default([]) | map(attribute='name') | list }}
+- name: Assert _provider_tiers is defined and non-empty
+  ansible.builtin.assert:
+    that:
+      - _provider_tiers is defined
+      - _provider_tiers | length > 0
+    fail_msg: >-
+      _provider_tiers must be provided by the service role dispatcher.
+
+- name: Validate all tiers use NFS protocol
+  ansible.builtin.assert:
+    that:
+      - item.protocol is defined
+      - item.protocol == 'nfs'
+    fail_msg: >-
+      Tier '{{ item.name }}' has protocol '{{ item.protocol | default('undefined') }}'.
+      Pure Storage FlashBlade only supports NFS.
+  loop: "{{ _provider_tiers }}"
+  loop_control:
+    label: "{{ item.name }}"
+
+- name: Build expected StorageClass entries per tier
+  ansible.builtin.set_fact:
+    _pure_expected_sc_entries: >-
+      {% set entries = [] -%}
+      {% for tier in _provider_tiers -%}
+      {% set _ = entries.append({'name': 'pure-nfs-' ~ tenant_name ~ '-' ~ tier.name, 'tier': tier.name}) -%}
+      {% endfor -%}
+      {{ entries }}
+    _pure_expected_sc_names: >-
+      {% set names = [] -%}
+      {% for tier in _provider_tiers -%}
+      {% set _ = names.append('pure-nfs-' ~ tenant_name ~ '-' ~ tier.name) -%}
+      {% endfor -%}
+      {{ names }}
+
+# Short-circuit -- check if ALL tiers' StorageClasses already exist
+- name: Check existing tenant StorageClasses
+  kubernetes.core.k8s_info:
+    api_version: storage.k8s.io/v1
+    kind: StorageClass
+    label_selectors:
+      - "osac.openshift.io/tenant={{ tenant_name }}"
+      - "app.kubernetes.io/managed-by=osac-aap"
+  register: _pure_sc_checks
+
+- name: Determine if all StorageClasses already exist
+  ansible.builtin.set_fact:
+    _pure_all_sc_exist: >-
+      {{ (_pure_expected_sc_names | difference(
+            _pure_sc_checks.resources | map(attribute='metadata.name') | list
+          ) | length) == 0 }}
+
+- name: Set output facts and skip provisioning when all SCs exist
+  when: _pure_all_sc_exist | bool
+  block:
+    - name: Set StorageClass names output (short-circuit)
+      ansible.builtin.set_fact:
+        storage_provider_storage_class_names: "{{ _pure_expected_sc_entries }}"
+
+    - name: Log short-circuit
+      ansible.builtin.debug:
+        msg: "All {{ _pure_expected_sc_names | length }} StorageClasses already exist — skipping provisioning."
+
+# --- Full provisioning path ---
+- name: Provision StorageClasses and CSI resources
+  when: not (_pure_all_sc_exist | bool)
+  block:
+    - name: Read tenant config Secret from hub
+      kubernetes.core.k8s_info:
+        api_version: v1
+        kind: Secret
+        name: "{{ pure_storage_tenant_config_secret_prefix }}{{ tenant_name }}"
+        namespace: "{{ pure_storage_config_namespace }}"
+      register: _pure_tenant_config
+      no_log: true
+
+    - name: Fail if tenant config Secret is missing
+      ansible.builtin.fail:
+        msg: >-
+          Tenant config Secret {{ pure_storage_tenant_config_secret_prefix }}{{ tenant_name }}
+          not found in namespace {{ pure_storage_config_namespace }}.
+          Run the setup action first.
+      when: _pure_tenant_config.resources | length == 0
+
+    - name: Extract Realm credentials from tenant config Secret
+      ansible.builtin.set_fact:
+        _realm_name: "{{ _pure_tenant_config.resources[0].data.realm_name | b64decode }}"
+        _api_token: "{{ _pure_tenant_config.resources[0].data.api_token | b64decode }}"
+        _mgmt_endpoint: "{{ _pure_tenant_config.resources[0].data.mgmt_endpoint | b64decode }}"
+        _nfs_endpoint: "{{ _pure_tenant_config.resources[0].data.nfs_endpoint | b64decode }}"
+        _pure_nfs_server: "{{ _pure_tenant_config.resources[0].data.nfs_server | b64decode }}"
+      no_log: true
+
+    - name: Generate pure.json CSI credentials Secret
+      ansible.builtin.include_tasks: ensure_pure_csi_secret.yaml
+
+    - name: Create StorageClass per tier
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: storage.k8s.io/v1
+          kind: StorageClass
+          metadata:
+            name: "pure-nfs-{{ tenant_name }}-{{ item.name }}"
+            labels:
+              osac.openshift.io/tenant: "{{ tenant_name }}"
+              osac.openshift.io/tier: "{{ item.name }}"
+              app.kubernetes.io/managed-by: osac-aap
+          provisioner: "{{ pure_storage_csi_provisioner }}"
+          parameters:
+            backend: file
+            nfs_endpoint: "{{ _nfs_endpoint }}"
+            createoptions: "{{ pure_storage_nfs_version }}"
+          reclaimPolicy: Delete
+          volumeBindingMode: Immediate
+          allowVolumeExpansion: true
+      loop: "{{ _provider_tiers }}"
+      loop_control:
+        label: "{{ item.name }}"
+
+    - name: Set StorageClass names output
+      ansible.builtin.set_fact:
+        storage_provider_storage_class_names: "{{ _pure_expected_sc_entries }}"
+
+  always:
+    - name: Clear Realm credentials from facts
+      ansible.builtin.set_fact:
+        _realm_name: null
+        _api_token: null
+        _mgmt_endpoint: null
+        _nfs_endpoint: null
+        _pure_nfs_server: null
+>>>>>>> a1ac262a8 (POC: Pure FlashBlade realm provisioning with direct REST API)
