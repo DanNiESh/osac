@@ -196,7 +196,7 @@ Configure these on the array first:
 | Object | Config key | GUI |
 |---|---|---|
 | File Services + Default Array Server | — | Storage → File Systems (File Services setup wizard) |
-| File VIF (NFS endpoint) | `test_fa_nfs_endpoint` | Settings → Network → Interfaces (service: File) |
+| File VIF (NFS endpoint) | `test_fa_nfs_endpoint` | Storage → File Systems → Servers → Default Array Server → Interfaces |
 | Parent file system (array root, not in a pod) | `test_fa_file_system` | Storage → File Systems |
 | NFS export policy | `test_fa_nfs_policy` | Storage → File Systems → Policies |
 | API token | `PURE_FA_API_TOKEN` | Settings → Users and Policies → API Tokens |
@@ -214,6 +214,14 @@ purenetwork eth list --service file   # the address is the NFS endpoint
 purepolicy nfs list
 purepolicy nfs rule list
 ```
+
+In Purity 6.8.7+ (REST 2.44+) a file VIF belongs to a file server and the
+array reports it as `<server>::<vif>`; the default file server is
+`_array_server`. Those versions have no global Interfaces entry — open the
+file server under Storage → File Systems → Servers. Older Purity creates the
+VIF under Settings/System → Network → Interfaces with the File service
+selected. If no file server exists yet, the File Services setup wizard creates
+the Default Array Server, and its Ethernet interface step creates the VIF.
 
 ### Configuration
 
