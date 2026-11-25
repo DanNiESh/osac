@@ -27,7 +27,7 @@
     test_backend_id: be-pure-fa-test
     pure_storage_backend_type: flasharray
     pure_storage_fa_nfs_policy: "{{ test_fa_nfs_policy }}"
-    pure_storage_fa_nfs_server: "{{ test_fa_nfs_server }}"
+    pure_storage_fa_file_system: "{{ test_fa_file_system }}"
 
   tasks:
     - name: Assert FlashArray test inputs are set
@@ -36,11 +36,11 @@
           - test_fa_mgmt_endpoint | length > 0
           - test_fa_nfs_endpoint | length > 0
           - test_fa_nfs_policy | length > 0
-          - test_fa_nfs_server | length > 0
+          - test_fa_file_system | length > 0
           - test_fa_api_token | length > 0
         fail_msg: >-
           Set test_fa_mgmt_endpoint, test_fa_nfs_endpoint, test_fa_nfs_policy
-          and test_fa_nfs_server in flasharray.yaml, and export
+          and test_fa_file_system in flasharray.yaml, and export
           PURE_FA_API_TOKEN.
         success_msg: "FlashArray test inputs are set"
         quiet: true
@@ -137,8 +137,8 @@
       ansible.builtin.assert:
         that:
           - _hub_data.realm_name | default('') | b64decode == ''
-          - _hub_data.fa_file_system | b64decode == 'osac-' + test_tenant
-          - _hub_data.nfs_server | b64decode == test_fa_nfs_server
+          - _hub_data.fa_file_system | b64decode == test_fa_file_system
+          - _hub_data.nfs_server | b64decode == ''
           - _hub_data.nfs_policy | b64decode == test_fa_nfs_policy
           - _hub_data.mgmt_endpoint | b64decode == test_fa_mgmt_endpoint
           - _hub_data.nfs_endpoint | b64decode == test_fa_nfs_endpoint
@@ -250,9 +250,9 @@
         that:
           - item.provisioner == 'pxd.portworx.com'
           - _params.backend == 'pure_fa_file'
-          - _params.pure_fa_file_system == 'osac-' + test_tenant
-          - _params.pure_nfs_server == test_fa_nfs_server
+          - _params.pure_fa_file_system == test_fa_file_system
           - _params.pure_nfs_policy == test_fa_nfs_policy
+          - _params.pure_nfs_server is not defined
           - _params.pure_fb_hard_limit_enabled is not defined
           - _params['csi.storage.k8s.io/provisioner-secret-name'] == 'pure-csi-secret-' + test_backend_id
           - _params['csi.storage.k8s.io/node-publish-secret-namespace'] == test_namespace
@@ -356,7 +356,7 @@
         msg:
           - "════════════════════════════════════════"
           - "FLASHARRAY FILE ONBOARDING TEST PASSED"
-          - "   - Hub Secret: no Realm, fa_file_system=osac-{{ test_tenant }}"
+          - "   - Hub Secret: no Realm, fa_file_system={{ test_fa_file_system }}"
           - "   - CSI Secret: FlashArrays entry"
           - "   - StorageClasses: backend=pure_fa_file"
           - "   - Idempotent on re-run"

@@ -239,10 +239,11 @@
               osac.openshift.io/storage-backend-id: "{{ _pure_backend_id }}"
               osac.openshift.io/tier: "{{ item.name }}"
           provisioner: "{{ pure_storage_csi_provisioner }}"
+          # PX-CSI provisions a managed directory inside the existing
+          # pure_fa_file_system and has no FlashArray NFS-server parameter.
           parameters:
             backend: pure_fa_file
             pure_fa_file_system: "{{ _pure_fa_file_system }}"
-            pure_nfs_server: "{{ _pure_nfs_server }}"
             pure_nfs_policy: "{{ _pure_nfs_policy }}"
             csi.storage.k8s.io/provisioner-secret-name: "{{ _pure_csi_secret_name }}"
             csi.storage.k8s.io/provisioner-secret-namespace: "{{ tenant_namespace }}"

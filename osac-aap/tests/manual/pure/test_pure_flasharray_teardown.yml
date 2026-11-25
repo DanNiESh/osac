@@ -22,7 +22,7 @@
     test_backend_id: be-pure-fa-test
     pure_storage_backend_type: flasharray
     pure_storage_fa_nfs_policy: "{{ test_fa_nfs_policy }}"
-    pure_storage_fa_nfs_server: "{{ test_fa_nfs_server }}"
+    pure_storage_fa_file_system: "{{ test_fa_file_system }}"
 
   tasks:
     - name: List cluster-side resources before teardown
@@ -179,6 +179,6 @@
           - "   - Hub Secret deleted (no Realm to release)"
           - "   - Idempotent on re-run"
           - "Manual cleanup still required on the array:"
-          - "   - FlashArray file system osac-{{ test_tenant }} (if created)"
+          - "   - Parent file system {{ test_fa_file_system }} (managed directories removed by PVC deletion)"
           - "   - Array-wide API token used for this test"
           - "════════════════════════════════════════"

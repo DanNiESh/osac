@@ -72,8 +72,9 @@ def test_defaults_declare_flasharray_mode():
 
     assert defaults["pure_storage_backend_type"] == "flashblade"
     assert defaults["pure_storage_fa_file_system_prefix"] == "osac-"
+    assert defaults["pure_storage_fa_file_system"] == ""
     assert defaults["pure_storage_fa_nfs_policy"] == ""
-    assert defaults["pure_storage_fa_nfs_server"] == ""
+    assert "pure_storage_fa_nfs_server" not in defaults
     assert defaults["pure_storage_csi_provisioner"] == "pxd.portworx.com"
 
 
@@ -102,7 +103,7 @@ def test_flasharray_setup_writes_hub_secret():
         "tenant_name": "test-tenant",
         "tenant_uid": "0123456789abcdef",
         "_pure_backend_id": "be-fa-test",
-        "_pure_nfs_server": "fa-server",
+        "_pure_nfs_server": "",
         "_pure_nfs_policy": "fa-policy",
         "_pure_fa_file_system": "osac-test-tenant",
         "_pure_api_token": FIXTURE_TOKEN,
@@ -121,7 +122,7 @@ def test_flasharray_setup_writes_hub_secret():
     data = _render(definition["stringData"], variables)
     assert data["realm_name"] == ""
     assert data["fa_file_system"] == "osac-test-tenant"
-    assert data["nfs_server"] == "fa-server"
+    assert data["nfs_server"] == ""
     assert data["nfs_policy"] == "fa-policy"
     assert data["storage_provider_type"] == "pure"
 
@@ -136,7 +137,7 @@ def test_flasharray_storageclass_parameters():
     variables = {
         "pure_storage_csi_provisioner": "pxd.portworx.com",
         "pure_storage_nfs_version": "nfsvers=4.1",
-        "_pure_nfs_server": "fa-server",
+        "_pure_nfs_server": "",
         "_pure_nfs_policy": "fa-policy",
         "_pure_fa_file_system": "osac-test-tenant",
         "_pure_csi_secret_name": "pure-csi-secret-be-fa-test",
@@ -152,8 +153,9 @@ def test_flasharray_storageclass_parameters():
     params = _render(definition["parameters"], variables)
     assert params["backend"] == "pure_fa_file"
     assert params["pure_fa_file_system"] == "osac-test-tenant"
-    assert params["pure_nfs_server"] == "fa-server"
     assert params["pure_nfs_policy"] == "fa-policy"
+    # PX-CSI's FlashArray File backend has no NFS-server parameter.
+    assert "pure_nfs_server" not in params
     assert "pure_fb_hard_limit_enabled" not in params
     assert params["csi.storage.k8s.io/provisioner-secret-name"] == (
         "pure-csi-secret-be-fa-test"
@@ -167,6 +169,38 @@ def test_flasharray_storageclass_parameters():
         "tcp",
     ]
     assert _render(definition["volumeBindingMode"], variables) == "Immediate"
+
+
+def test_flasharray_file_system_defaults_to_prefix_and_tenant():
+    """The parent file system is overridable and falls back to the prefix."""
+    tasks = _load_yaml(PURE_ROLE_DIR / "tasks" / "setup.yaml")
+
+    fact_task = _find_task(tasks, "Derive FlashArray allocation facts")
+    expression = fact_task["ansible.builtin.set_fact"]["_pure_fa_file_system"]
+
+    base = {
+        "pure_storage_fa_file_system_prefix": "osac-",
+        "tenant_name": "test-tenant",
+        "pure_storage_fa_nfs_policy": "fa-policy",
+    }
+
+    assert _render(expression, {**base, "pure_storage_fa_file_system": "existing-fs"}) == (
+        "existing-fs"
+    )
+    assert _render(expression, {**base, "pure_storage_fa_file_system": ""}) == (
+        "osac-test-tenant"
+    )
+    assert _render(expression, base) == "osac-test-tenant"
+
+
+def test_flasharray_setup_requires_export_policy_only():
+    """No NFS-server input is required for FlashArray File."""
+    tasks = _load_yaml(PURE_ROLE_DIR / "tasks" / "setup.yaml")
+
+    fa_task = _find_task(tasks, "Provision Pure Storage FlashArray File for tenant")
+    policy_task = _find_task(fa_task["block"], "Require FlashArray NFS export policy")
+
+    assert policy_task["when"] == "pure_storage_fa_nfs_policy | default('') | length == 0"
 
 
 def test_flasharray_csi_secret_uses_flasharrays():

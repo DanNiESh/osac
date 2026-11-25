@@ -12,7 +12,7 @@
 
 Hand-write everything; keep AAP out of it.
 
-1. **On the array:** Create an NFS export policy and a File Services data VIF/interface IP. Note whether a server object is needed (6.8.7+ multi-server support).
+1. **On the array:** Enable File Services (Default Array Server), create a File VIF, an NFS export policy, and the parent file system. PX-CSI provisions into the default file server, so no server name is passed.
 
 2. **Secret** — same two namespaces as today (osac-csi for controller, tenant namespace for node):
    ```json
@@ -31,9 +31,8 @@ Hand-write everything; keep AAP out of it.
    provisioner: pxd.portworx.com
    parameters:
      backend: pure_fa_file
-     pure_fa_file_system: osac-test-fs   # fs doesn't exist yet
+     pure_fa_file_system: osac-test-fs   # must already exist
      pure_nfs_policy: <policy-name>
-     pure_nfs_server: <server-name>
    mountOptions: [nfsvers=4.1, tcp]
    ```
 
@@ -42,11 +41,16 @@ Hand-write everything; keep AAP out of it.
    kubectl -n osac-csi-backends logs deployment/pure-csi-driver --tail=100
    ```
 
-**Decision point:**
-- **Outcome A** — A new file system appeared. Your assumption is correct: StorageClass is per-filesystem, provisioning is fully dynamic, and `pure_realm` has almost nothing to do (just ensure the export policy exists).
-- **Outcome B** — A managed directory appeared inside `osac-test-fs` (or provisioning failed because the fs didn't exist). The file system is admin-provisioned state, not dynamic. The realm-pool model still works, but something must create the filesystem at onboarding — that becomes `pure_realm`'s job.
+**Decision point — resolved by the driver docs, confirm on the array:**
+PX-CSI's `pure_fa_file` backend provisions **a managed directory in an existing
+file system**; it cannot create the file system, and it has no NFS-server
+parameter (only the default file server is supported). So the parent file
+system is admin-provisioned state, and onboarding must ensure it exists — that
+becomes `pure_realm`'s job if this path is ever promoted beyond testing.
 
-**Also record:** Does it need a pod? Does a pod at array root (outside any realm) work?
+**Also record:** the PVC size is advisory unless an array quota policy is
+applied; non-empty volumes cannot be deleted unless managed-directory overwrite
+is enabled (support-gated).
 
 ---
 
@@ -61,8 +65,8 @@ pure_storage_csi_provisioner: pxd.portworx.com  # unchanged, same driver
 
 # flasharray-only
 pure_storage_fa_file_system_prefix: "osac-"
+pure_storage_fa_file_system: ""        # existing parent fs; empty = <prefix><tenant>
 pure_storage_fa_nfs_policy: ""
-pure_storage_fa_nfs_server: ""
 ```
 
 The `nfs_server_suffix` / `export_policy_suffix` remain FlashBlade-only — they exist to build `realm::x` names that have no FA analogue.
@@ -79,9 +83,9 @@ For FlashArray, skip pool checkout and write the hub Secret directly:
 | Field | FlashArray |
 |-------|------------|
 | `realm_name` | omit, or the pod name if pods are required |
-| `nfs_server` | server object name |
+| `nfs_server` | not used (default array file server) |
 | `nfs_policy` | policy name |
-| `fa_file_system` | `osac-<tenant>` |
+| `fa_file_system` | `pure_storage_fa_file_system`, else `osac-<tenant>` |
 | `api_token` / `mgmt_endpoint` / `nfs_endpoint` | same as FlashBlade |
 
 **Note:** The existing validation around lines 103–124 hard-fails on empty `nfs_server`/`nfs_policy` — it needs the same `when: pure_storage_backend_type == 'flashblade'` guard.

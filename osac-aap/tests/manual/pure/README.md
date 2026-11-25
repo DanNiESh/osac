@@ -187,10 +187,34 @@ FlashArray has no Realm support, so this path skips the Realm pool and gives
 every tenant an array-wide token. Test environments only — see
 [`flasharray-file-plan.md`](flasharray-file-plan.md).
 
+### Array prerequisites
+
+PX-CSI's `pure_fa_file` backend creates a managed directory inside an
+**existing** parent file system — it cannot create the file system itself.
+Configure these on the array first:
+
+| Object | Config key | GUI |
+|---|---|---|
+| File Services + Default Array Server | — | Storage → File Systems (File Services setup wizard) |
+| File VIF (NFS endpoint) | `test_fa_nfs_endpoint` | Settings → Network → Interfaces (service: File) |
+| Parent file system | `test_fa_file_system` | Storage → File Systems |
+| NFS export policy | `test_fa_nfs_policy` | Storage → File Systems → Policies |
+| API token | `PURE_FA_API_TOKEN` | Settings → Users and Policies → API Tokens |
+
+The policy must allow the node networks and NFS v4.1 (the StorageClass asks for
+`nfsvers=4.1`); the array policy overrides `mountOptions`. Verify with:
+
+```bash
+purefs list
+purenetwork eth list --service file   # the address is the NFS endpoint
+purepolicy nfs list
+purepolicy nfs rule list
+```
+
 ### Configuration
 
-Edit `flasharray.yaml` (management VIP, NFS VIP, export policy, NFS server)
-and export the array-wide token so it never lands in git:
+Edit `flasharray.yaml` (management VIP, NFS VIP, export policy, parent file
+system) and export the array-wide token so it never lands in git:
 
 ```bash
 export PURE_FA_API_TOKEN="$(< /tmp/fa-api-token)"
@@ -251,10 +275,11 @@ kubectl -n osac-csi-backends logs deploy/pure-csi-controller \
   -c pure-csi-driver --tail=100
 ```
 
-Outcome A: the array shows a new file system. Outcome B: a managed directory
-appeared inside `osac-test-pure-tenant` or provisioning failed because the
-file system is admin-provisioned. Record which one; it decides whether
-`pure_realm` must create the file system (see the plan).
+A bound PVC does not create a file system: the PV is a managed directory
+(with its export) inside `test_fa_file_system`. Confirm on the array with
+`puredir list --file-system <fs>`. If the parent file system or export policy
+is missing, CreateVolume fails and the PVC stays `Pending` — check the
+controller log in that case.
 
 ### Step 4 — Teardown
 

@@ -341,14 +341,15 @@
 - name: Provision Pure Storage FlashArray File for tenant
   when: pure_storage_backend_type == 'flasharray'
   block:
-    - name: Require FlashArray NFS server and export policy
+    # PX-CSI's FlashArray File backend takes no NFS-server parameter: it
+    # provisions into the array's default file server, so only the export
+    # policy and the existing parent file system are inputs.
+    - name: Require FlashArray NFS export policy
       ansible.builtin.fail:
         msg: >-
-          pure_storage_fa_nfs_server and pure_storage_fa_nfs_policy must be set
-          when pure_storage_backend_type is 'flasharray'.
-      when: >-
-        pure_storage_fa_nfs_server | default('') | length == 0 or
-        pure_storage_fa_nfs_policy | default('') | length == 0
+          pure_storage_fa_nfs_policy must be set when
+          pure_storage_backend_type is 'flasharray'.
+      when: pure_storage_fa_nfs_policy | default('') | length == 0
 
     - name: Read the FlashArray backend connection
       ansible.builtin.set_fact:
@@ -370,13 +371,16 @@
 
     # The file system is admin-visible state at array root: FlashArray refuses
     # file systems inside Realms, so there is no Realm to check out and the
-    # array-wide token is recorded as-is. The CSI driver creates the file
-    # system when the first PVC is provisioned from pure_fa_file_system.
+    # array-wide token is recorded as-is. The parent file system must already
+    # exist — PX-CSI creates a managed directory inside it per PVC, not the
+    # file system itself.
     - name: Derive FlashArray allocation facts
       ansible.builtin.set_fact:
         _pure_realm_name: ""
-        _pure_fa_file_system: "{{ pure_storage_fa_file_system_prefix }}{{ tenant_name }}"
-        _pure_nfs_server: "{{ pure_storage_fa_nfs_server }}"
+        _pure_fa_file_system: >-
+          {{ pure_storage_fa_file_system
+             | default(pure_storage_fa_file_system_prefix ~ tenant_name, true) }}
+        _pure_nfs_server: ""
         _pure_nfs_policy: "{{ pure_storage_fa_nfs_policy }}"
         _pure_mgmt_endpoint: >-
           {{ _pure_fa_connection.mgmt_endpoint

@@ -13,11 +13,13 @@ pure_storage_csi_provisioner: "pxd.portworx.com"
 pure_storage_backend_type: "flashblade"
 
 # FlashArray-only settings, ignored when pure_storage_backend_type is
-# flashblade. The CSI driver provisions the file system named
-# <prefix><tenant> from the StorageClass's pure_fa_file_system parameter.
+# flashblade. FlashArray File provisions a managed directory inside an
+# existing parent file system: the driver cannot create the file system.
+# Set pure_storage_fa_file_system to that file system's name; when empty the
+# role derives <prefix><tenant>. The file system must already exist.
 pure_storage_fa_file_system_prefix: "osac-"
+pure_storage_fa_file_system: ""
 pure_storage_fa_nfs_policy: ""
-pure_storage_fa_nfs_server: ""
 
 # Hub Secret prefix for per-tenant Pure config
 pure_storage_tenant_config_secret_prefix: "pure-tenant-config-"
