@@ -14,6 +14,12 @@ Hand-write everything; keep AAP out of it.
 
 1. **On the array:** Enable File Services (Default Array Server), create a File VIF, an NFS export policy, and the parent file system. PX-CSI provisions into the default file server, so no server name is passed.
 
+   The parent file system must be top-level (array root), addressed by plain
+   name. Purity does allow filesystems inside pods (`pod::fs`), but pods are an
+   ActiveCluster volume boundary, not a tenancy or file boundary: PX-CSI's
+   `pure_fa_file` contract names a single top-level file system and exposes no
+   pod parameter, so a pod-qualified name is undocumented and unverified.
+
 2. **Secret** — same two namespaces as today (osac-csi for controller, tenant namespace for node):
    ```json
    {
@@ -155,6 +161,9 @@ order, driver credential sync and the PVC probe are in [`README.md`](README.md).
 2. **FlashArray refuses filesystems in realms:** Empirically verified error: `"<realm>::<pod>::<fs>: File system in realm is not supported"`
 3. **No realm-pool model:** There's nothing to check out — file systems live at array root.
 4. **Multi-tenant file on Pure = FlashBlade:** The existing realm-pool design is production-ready there.
+5. **Pods do not substitute for Realms here:** a FlashArray pod groups volumes
+   for ActiveCluster mobility; it provides no file-level isolation, and PX-CSI
+   does not accept a pod-qualified parent file system.
 
 For production multi-tenant file storage on Pure, use **FlashBlade** with the existing implementation.
 
