@@ -181,6 +181,134 @@ ansible-playbook tests/manual/test_pure_teardown_backend.yml
 
 ---
 
+## FlashArray File (Test-Only)
+
+FlashArray has no Realm support, so this path skips the Realm pool and gives
+every tenant an array-wide token. Test environments only — see
+[`flasharray-file-plan.md`](flasharray-file-plan.md).
+
+### Array prerequisites
+
+PX-CSI's `pure_fa_file` backend creates a managed directory inside an
+**existing** parent file system — it cannot create the file system itself.
+Configure these on the array first:
+
+| Object | Config key | GUI |
+|---|---|---|
+| File Services + Default Array Server | — | Storage → File Systems (File Services setup wizard) |
+| File VIF (NFS endpoint) | `test_fa_nfs_endpoint` | Storage → File Systems → Servers → Default Array Server → Interfaces |
+| Parent file system (array root, not in a pod) | `test_fa_file_system` | Storage → File Systems |
+| NFS export policy | `test_fa_nfs_policy` | Storage → File Systems → Policies |
+| API token | `PURE_FA_API_TOKEN` | Settings → Users and Policies → API Tokens |
+
+The policy must allow the node networks and NFS v4.1 (the StorageClass asks for
+`nfsvers=4.1`); the array policy overrides `mountOptions`. If pods set
+`fsGroup` or change ownership, the policy needs `no_root_squash` and NFS User
+Mapping must be disabled, otherwise mounts fail with `permission denied` or
+`lchown failed`. A quota policy is optional but without one the PVC size is
+advisory — `df` in the pod reports the whole parent file system. Verify with:
+
+```bash
+purefs list
+purenetwork eth list --service file   # the address is the NFS endpoint
+purepolicy nfs list
+purepolicy nfs rule list
+```
+
+In Purity 6.8.7+ (REST 2.44+) a file VIF belongs to a file server and the
+array reports it as `<server>::<vif>`; the default file server is
+`_array_server`. Those versions have no global Interfaces entry — open the
+file server under Storage → File Systems → Servers. Older Purity creates the
+VIF under Settings/System → Network → Interfaces with the File service
+selected. If no file server exists yet, the File Services setup wizard creates
+the Default Array Server, and its Ethernet interface step creates the VIF.
+
+### Configuration
+
+If `kubectl` reports `connection refused` on `127.0.0.1:<port>`, the kind API
+port rotated when the container restarted; refresh the context with
+`kind export kubeconfig --name osac-test`.
+
+Edit `flasharray.yaml` (management VIP, NFS VIP, export policy, parent file
+system) and export the array-wide token so it never lands in git:
+
+```bash
+export PURE_FA_API_TOKEN="$(< /tmp/fa-api-token)"
+```
+
+### Step 1 — Onboard the tenant
+
+```bash
+ansible-playbook tests/manual/pure/test_pure_flasharray.yml
+```
+
+Runs `setup` + `ensure_storage_class` through the dispatcher. The playbook
+asserts the hub Secret (`fa_file_system`, `pure-backend-type=flasharray`, no
+Realm label), the `FlashArrays` CSI Secret, and `backend: pure_fa_file`
+StorageClasses. No array API call is made at this step.
+
+### Step 2 — Point the standalone driver at the FlashArray
+
+The provisioner reads `px-pure-secret` / `pure-csi-credentials` from
+`osac-csi`; the role writes `pure-csi-secret-<backend-id>` for the
+StorageClass. Copy the payload into both namespaces:
+
+```bash
+PAYLOAD=$(kubectl -n osac-system get secret pure-csi-secret-be-pure-fa-test \
+  -o jsonpath='{.data.pure\.json}' | base64 -d)
+for ns in osac-csi osac-csi-backends; do
+  for name in pure-csi-credentials px-pure-secret; do
+    kubectl -n "$ns" create secret generic "$name" \
+      --from-literal=pure.json="$PAYLOAD" --dry-run=client -o yaml | kubectl apply -f -
+  done
+done
+kubectl -n osac-csi rollout restart ds/pure-csi-node
+kubectl -n osac-csi-backends rollout restart deploy/pure-csi-controller
+```
+
+If the driver is not installed yet, install it first:
+[`pure-csi-driver-installation.md`](pure-csi-driver-installation.md).
+
+### Step 3 — Create a PVC (Phase 0 decision point)
+
+```bash
+kubectl apply -f - <<EOF
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: pure-fa-test
+  namespace: osac-system
+spec:
+  accessModes: [ReadWriteMany]   # FA File Services supports RWX only
+  storageClassName: pure-nfs-test-pure-tenant-default
+  resources:
+    requests:
+      storage: 1Gi
+EOF
+
+kubectl -n osac-system get pvc pure-fa-test
+kubectl -n osac-csi-backends logs deploy/pure-csi-controller \
+  -c pure-csi-driver --tail=100
+```
+
+A bound PVC does not create a file system: the PV is a managed directory
+(with its export) inside `test_fa_file_system`. Confirm on the array with
+`puredir list --file-system <fs>`. If the parent file system or export policy
+is missing, CreateVolume fails and the PVC stays `Pending` — check the
+controller log in that case.
+
+### Step 4 — Teardown
+
+```bash
+kubectl -n osac-system delete pvc pure-fa-test
+ansible-playbook tests/manual/pure/test_pure_flasharray_teardown.yml
+```
+
+The playbook removes StorageClasses, both Secrets and the hub Secret. Array
+resources (file system, API token) are not deleted.
+
+---
+
 ## Complete Test Workflow
 
 ### Setup Flow
@@ -203,7 +331,7 @@ metadata:
   name: pure-test-pvc
   namespace: osac-system
 spec:
-  accessModes: [ReadWriteOnce]
+  accessModes: [ReadWriteMany]   # FA File Services supports RWX only
   storageClassName: pure-nfs-test-pure-tenant-default
   resources:
     requests:

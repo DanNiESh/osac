@@ -1,0 +1,27 @@
+---
+# FlashArray File manual-test configuration (test-only).
+#
+# Edit the non-secret values below for your array. The API token is read from
+# the environment so it never lands in git:
+#
+#   export PURE_FA_API_TOKEN="$(< /tmp/fa-api-token)"
+#
+# WARNING: this path uses an array-wide FlashArray API token. Every tenant
+# shares full array access — test environments only.
+
+# FlashArray management VIP (REST API endpoint).
+test_fa_mgmt_endpoint: "rhos-purestorage01.mgmt.lab.eng.brq2.redhat.com"
+
+# File Services data VIP used for NFS mounts.
+test_fa_nfs_endpoint: "10.0.0.11"
+
+# Existing NFS export policy on the array. It must permit the node networks
+# and the NFS version the StorageClass requests (nfsvers=4.1).
+test_fa_nfs_policy: "osac-fa-file-policy"
+
+# Existing parent file system on the array. PX-CSI creates a managed
+# directory inside it per PVC; it cannot create the file system itself.
+test_fa_file_system: "osac-test-pure-tenant"
+
+# Array-wide API token; keep it out of this file.
+test_fa_api_token: "{{ lookup('env', 'PURE_FA_API_TOKEN') }}"

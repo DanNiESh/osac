@@ -72,12 +72,22 @@
       no_log: true
 
     - name: Report backend teardown summary
+      when: pure_storage_backend_type == 'flashblade'
       ansible.builtin.debug:
         msg: >-
           Backend teardown for tenant '{{ tenant_name }}' complete.
           Hub Secret: {{ 'deleted' if (_pure_secret_existed | bool) else 'not found (already deleted)' }}.
           Realm '{{ _pure_teardown_realm_name | default("N/A") }}' released back to pool.
           Note: Filesystems created by CSI driver are NOT deleted (managed by PVC lifecycle).
+
+    - name: Report FlashArray backend teardown summary
+      when: pure_storage_backend_type == 'flasharray'
+      ansible.builtin.debug:
+        msg: >-
+          Backend teardown for tenant '{{ tenant_name }}' complete.
+          Hub Secret: {{ 'deleted' if (_pure_secret_existed | bool) else 'not found (already deleted)' }}.
+          FlashArray file system and array-wide credentials are NOT deleted by
+          this role; remove them on the array when the test is finished.
 
   always:
     - name: Clear all credential facts from play scope

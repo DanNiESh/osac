@@ -1,0 +1,364 @@
+---
+# Test Pure Storage FlashArray File (test-only) tenant onboarding.
+#
+# Runs setup + ensure_storage_class through the storage_provider dispatcher
+# with pure_storage_backend_type=flasharray. Neither action calls the array:
+# setup writes the hub Secret, ensure_storage_class writes the CSI Secret and
+# StorageClasses. The array is first contacted when the CSI driver provisions
+# the first PVC (Phase 0 in flasharray-file-plan.md).
+#
+# Configuration: edit flasharray.yaml next to this playbook, then export
+# PURE_FA_API_TOKEN. See README.md for the full run order.
+#
+# WARNING: test-only path. The hub and CSI Secrets hold an array-wide token,
+# so every tenant shares full array access. Never use this in production.
+
+- name: Test Pure Storage FlashArray File onboarding
+  hosts: localhost
+  gather_facts: false
+
+  vars_files:
+    - flasharray.yaml
+
+  vars:
+    test_namespace: osac-system
+    test_tenant: test-pure-tenant
+    test_tenant_uid: test-uid-12345
+    test_backend_id: be-pure-fa-test
+    pure_storage_backend_type: flasharray
+    pure_storage_fa_nfs_policy: "{{ test_fa_nfs_policy }}"
+    pure_storage_fa_file_system: "{{ test_fa_file_system }}"
+
+  tasks:
+    - name: Assert FlashArray test inputs are set
+      ansible.builtin.assert:
+        that:
+          - test_fa_mgmt_endpoint | length > 0
+          - test_fa_nfs_endpoint | length > 0
+          - test_fa_nfs_policy | length > 0
+          - test_fa_file_system | length > 0
+          - test_fa_api_token | length > 0
+        fail_msg: >-
+          Set test_fa_mgmt_endpoint, test_fa_nfs_endpoint, test_fa_nfs_policy
+          and test_fa_file_system in flasharray.yaml, and export
+          PURE_FA_API_TOKEN.
+        success_msg: "FlashArray test inputs are set"
+        quiet: true
+
+    - name: Verify hub namespace exists
+      kubernetes.core.k8s_info:
+        api_version: v1
+        kind: Namespace
+        name: "{{ test_namespace }}"
+      register: _hub_namespace
+
+    - name: Fail when the hub namespace is missing
+      ansible.builtin.assert:
+        that:
+          - _hub_namespace.resources | length == 1
+        fail_msg: "Namespace {{ test_namespace }} not found; create it first"
+        success_msg: "Namespace {{ test_namespace }} exists"
+        quiet: true
+
+    # ── setup: hub Secret, no Realm checkout ──
+    - name: Run setup through the storage_provider dispatcher
+      block:
+        - name: Call storage_provider dispatcher with setup
+          ansible.builtin.include_role:
+            name: osac.service.storage_provider
+          vars:
+            storage_provider_action: setup
+            storage_provider_provisioning_target: vmaas
+            tenant_name: "{{ test_tenant }}"
+            tenant_uid: "{{ test_tenant_uid }}"
+            tenant_namespace: "{{ test_namespace }}"
+            storage_provider_tiers:
+              - name: default
+                protocol: nfs
+                provider: pure
+                backend_id: "{{ test_backend_id }}"
+              - name: fast
+                protocol: nfs
+                provider: pure
+                backend_id: "{{ test_backend_id }}"
+            storage_provider_backend_connections:
+              "{{ test_backend_id }}":
+                mgmt_endpoint: "{{ test_fa_mgmt_endpoint }}"
+                nfs_endpoint: "{{ test_fa_nfs_endpoint }}"
+                api_token: "{{ test_fa_api_token }}"
+      rescue:
+        - name: Show setup failure details
+          ansible.builtin.debug:
+            msg:
+              - "Setup failed!"
+              - "Task: {{ ansible_failed_task.name | default('unknown') }}"
+              - "Error: {{ ansible_failed_result.msg | default('no message') }}"
+
+        - name: Fail with error details
+          ansible.builtin.fail:
+            msg: "Setup failed - see above for details"
+
+    - name: Read the hub Secret created by setup
+      kubernetes.core.k8s_info:
+        api_version: v1
+        kind: Secret
+        name: "pure-tenant-config-{{ test_tenant }}-{{ test_backend_id }}"
+        namespace: "{{ test_namespace }}"
+      register: _hub_secret
+
+    - name: Assert hub Secret was created
+      ansible.builtin.assert:
+        that:
+          - _hub_secret.resources | length == 1
+        fail_msg: "Hub Secret was not created"
+        success_msg: "Hub Secret created"
+        quiet: true
+
+    - name: Assert hub Secret carries FlashArray labels
+      vars:
+        _labels: "{{ _hub_secret.resources[0].metadata.labels }}"
+      ansible.builtin.assert:
+        that:
+          - _labels['osac.openshift.io/tenant'] == test_tenant
+          - _labels['osac.openshift.io/storage-backend-id'] == test_backend_id
+          - _labels['osac.openshift.io/pure-backend-type'] == 'flasharray'
+          - _labels['osac.openshift.io/pure-realm'] is not defined
+        fail_msg: "Hub Secret labels incorrect: {{ _labels }}"
+        success_msg: "Hub Secret has FlashArray labels and no Realm label"
+        quiet: true
+
+    - name: Extract hub Secret data
+      ansible.builtin.set_fact:
+        _hub_data: "{{ _hub_secret.resources[0].data }}"
+        _hub_uid: "{{ _hub_secret.resources[0].metadata.uid }}"
+      no_log: true
+
+    - name: Assert hub Secret records the FlashArray allocation
+      ansible.builtin.assert:
+        that:
+          - _hub_data.realm_name | default('') | b64decode == ''
+          - _hub_data.fa_file_system | b64decode == test_fa_file_system
+          - _hub_data.nfs_server | b64decode == ''
+          - _hub_data.nfs_policy | b64decode == test_fa_nfs_policy
+          - _hub_data.mgmt_endpoint | b64decode == test_fa_mgmt_endpoint
+          - _hub_data.nfs_endpoint | b64decode == test_fa_nfs_endpoint
+          - _hub_data.api_token | b64decode | length > 0
+        fail_msg: "Hub Secret fields incorrect"
+        success_msg: "Hub Secret records fa_file_system and no Realm"
+        quiet: true
+
+    - name: Assert tenant_uid_hash is recorded
+      ansible.builtin.assert:
+        that:
+          - _hub_data.tenant_uid_hash | b64decode == test_tenant_uid[:8]
+        fail_msg: "tenant_uid_hash incorrect"
+        success_msg: "tenant_uid_hash recorded"
+        quiet: true
+
+    - name: Re-run setup to check idempotency
+      ansible.builtin.include_role:
+        name: osac.service.storage_provider
+      vars:
+        storage_provider_action: setup
+        storage_provider_provisioning_target: vmaas
+        tenant_name: "{{ test_tenant }}"
+        tenant_uid: "{{ test_tenant_uid }}"
+        tenant_namespace: "{{ test_namespace }}"
+        storage_provider_tiers:
+          - name: default
+            protocol: nfs
+            provider: pure
+            backend_id: "{{ test_backend_id }}"
+        storage_provider_backend_connections:
+          "{{ test_backend_id }}":
+            mgmt_endpoint: "{{ test_fa_mgmt_endpoint }}"
+            nfs_endpoint: "{{ test_fa_nfs_endpoint }}"
+            api_token: "{{ test_fa_api_token }}"
+
+    - name: Read the hub Secret again
+      kubernetes.core.k8s_info:
+        api_version: v1
+        kind: Secret
+        name: "pure-tenant-config-{{ test_tenant }}-{{ test_backend_id }}"
+        namespace: "{{ test_namespace }}"
+      register: _hub_secret_rerun
+
+    - name: Assert setup is idempotent
+      ansible.builtin.assert:
+        that:
+          - _hub_secret_rerun.resources[0].metadata.uid == _hub_uid
+        fail_msg: "Re-run replaced the hub Secret"
+        success_msg: "Idempotency: hub Secret updated in place"
+        quiet: true
+
+    # ── ensure_storage_class: CSI Secret + StorageClasses ──
+    - name: Run ensure_storage_class through the dispatcher
+      ansible.builtin.include_role:
+        name: osac.service.storage_provider
+      vars:
+        storage_provider_action: ensure_storage_class
+        storage_provider_provisioning_target: vmaas
+        tenant_name: "{{ test_tenant }}"
+        tenant_uid: "{{ test_tenant_uid }}"
+        tenant_namespace: "{{ test_namespace }}"
+        storage_provider_tiers:
+          - name: default
+            protocol: nfs
+            provider: pure
+            backend_id: "{{ test_backend_id }}"
+          - name: fast
+            protocol: nfs
+            provider: pure
+            backend_id: "{{ test_backend_id }}"
+        storage_provider_backend_connections:
+          "{{ test_backend_id }}":
+            mgmt_endpoint: "{{ test_fa_mgmt_endpoint }}"
+            nfs_endpoint: "{{ test_fa_nfs_endpoint }}"
+            api_token: "{{ test_fa_api_token }}"
+
+    - name: List tenant StorageClasses
+      kubernetes.core.k8s_info:
+        api_version: storage.k8s.io/v1
+        kind: StorageClass
+        label_selectors:
+          - "osac.openshift.io/tenant={{ test_tenant }}"
+          - "osac.openshift.io/storage-provider=pure"
+          - "osac.openshift.io/storage-backend-id={{ test_backend_id }}"
+      register: _storage_classes
+
+    - name: Show created StorageClasses
+      ansible.builtin.debug:
+        msg: "StorageClasses: {{ _storage_classes.resources | map(attribute='metadata.name') | list }}"
+
+    - name: Assert one StorageClass per tier was created
+      ansible.builtin.assert:
+        that:
+          - _storage_classes.resources | length == 2
+          - ('pure-nfs-' + test_tenant + '-default') in (_storage_classes.resources | map(attribute='metadata.name') | list)
+          - ('pure-nfs-' + test_tenant + '-fast') in (_storage_classes.resources | map(attribute='metadata.name') | list)
+        fail_msg: >-
+          Expected pure-nfs-{{ test_tenant }}-default and
+          pure-nfs-{{ test_tenant }}-fast, got
+          {{ _storage_classes.resources | map(attribute='metadata.name') | list }}
+        success_msg: "Both StorageClasses created"
+        quiet: true
+
+    - name: Assert StorageClass parameters use the FlashArray File backend
+      vars:
+        _params: "{{ item.parameters }}"
+      ansible.builtin.assert:
+        that:
+          - item.provisioner == 'pxd.portworx.com'
+          - _params.backend == 'pure_fa_file'
+          - _params.pure_fa_file_system == test_fa_file_system
+          - _params.pure_nfs_policy == test_fa_nfs_policy
+          - _params.pure_nfs_server is not defined
+          - _params.pure_fb_hard_limit_enabled is not defined
+          - _params['csi.storage.k8s.io/provisioner-secret-name'] == 'pure-csi-secret-' + test_backend_id
+          - _params['csi.storage.k8s.io/node-publish-secret-namespace'] == test_namespace
+          - item.mountOptions | sort == ['nfsvers=4.1', 'tcp'] | sort
+        fail_msg: "StorageClass {{ item.metadata.name }} parameters incorrect: {{ _params }}"
+        success_msg: "StorageClass {{ item.metadata.name }} uses pure_fa_file"
+        quiet: true
+      loop: "{{ _storage_classes.resources }}"
+      loop_control:
+        label: "{{ item.metadata.name }}"
+
+    - name: Record StorageClass UIDs before the idempotency re-run
+      ansible.builtin.set_fact:
+        _storage_class_uids: >-
+          {{ _storage_classes.resources
+             | map(attribute='metadata.uid') | sort | list }}
+
+    - name: Read the FlashArray CSI Secret
+      kubernetes.core.k8s_info:
+        api_version: v1
+        kind: Secret
+        name: "pure-csi-secret-{{ test_backend_id }}"
+        namespace: "{{ test_namespace }}"
+      register: _csi_secret
+
+    - name: Assert the CSI Secret exists
+      ansible.builtin.assert:
+        that:
+          - _csi_secret.resources | length == 1
+        fail_msg: "CSI Secret pure-csi-secret-{{ test_backend_id }} not found"
+        success_msg: "CSI Secret created"
+        quiet: true
+
+    - name: Decode the CSI Secret payload
+      ansible.builtin.set_fact:
+        _csi_json: "{{ (_csi_secret.resources[0].data['pure.json'] | b64decode) | from_json }}"
+      no_log: true
+
+    - name: Assert the CSI Secret holds FlashArray credentials only
+      ansible.builtin.assert:
+        that:
+          - _csi_json.FlashArrays | default([]) | length == 1
+          - _csi_json.FlashBlades is not defined
+          - _csi_json.FlashArrays[0].MgmtEndPoint == test_fa_mgmt_endpoint
+          - _csi_json.FlashArrays[0].NFSEndPoint == test_fa_nfs_endpoint
+          - _csi_json.FlashArrays[0].APIToken | length > 0
+        fail_msg: "CSI Secret does not contain a FlashArrays entry"
+        success_msg: "CSI Secret contains FlashArrays credentials"
+        quiet: true
+
+    - name: Re-run ensure_storage_class to check idempotency
+      ansible.builtin.include_role:
+        name: osac.service.storage_provider
+      vars:
+        storage_provider_action: ensure_storage_class
+        storage_provider_provisioning_target: vmaas
+        tenant_name: "{{ test_tenant }}"
+        tenant_uid: "{{ test_tenant_uid }}"
+        tenant_namespace: "{{ test_namespace }}"
+        storage_provider_tiers:
+          - name: default
+            protocol: nfs
+            provider: pure
+            backend_id: "{{ test_backend_id }}"
+          - name: fast
+            protocol: nfs
+            provider: pure
+            backend_id: "{{ test_backend_id }}"
+        storage_provider_backend_connections:
+          "{{ test_backend_id }}":
+            mgmt_endpoint: "{{ test_fa_mgmt_endpoint }}"
+            nfs_endpoint: "{{ test_fa_nfs_endpoint }}"
+            api_token: "{{ test_fa_api_token }}"
+
+    - name: List tenant StorageClasses again
+      kubernetes.core.k8s_info:
+        api_version: storage.k8s.io/v1
+        kind: StorageClass
+        label_selectors:
+          - "osac.openshift.io/tenant={{ test_tenant }}"
+          - "osac.openshift.io/storage-provider=pure"
+          - "osac.openshift.io/storage-backend-id={{ test_backend_id }}"
+      register: _storage_classes_rerun
+
+    - name: Assert StorageClasses were not recreated
+      ansible.builtin.assert:
+        that:
+          - (_storage_classes_rerun.resources | map(attribute='metadata.uid') | sort | list) == _storage_class_uids
+        fail_msg: "Re-run replaced StorageClasses"
+        success_msg: "Idempotency: StorageClasses unchanged"
+        quiet: true
+
+    - name: Clear decoded credentials from facts
+      ansible.builtin.set_fact:
+        _hub_data: {}
+        _csi_json: {}
+      no_log: true
+
+    - name: Summary
+      ansible.builtin.debug:
+        msg:
+          - "════════════════════════════════════════"
+          - "FLASHARRAY FILE ONBOARDING TEST PASSED"
+          - "   - Hub Secret: no Realm, fa_file_system={{ test_fa_file_system }}"
+          - "   - CSI Secret: FlashArrays entry"
+          - "   - StorageClasses: backend=pure_fa_file"
+          - "   - Idempotent on re-run"
+          - "Next: sync driver credentials, then create a test PVC"
+          - "════════════════════════════════════════"
