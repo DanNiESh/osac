@@ -181,6 +181,93 @@ ansible-playbook tests/manual/test_pure_teardown_backend.yml
 
 ---
 
+## FlashArray File (Test-Only)
+
+FlashArray has no Realm support, so this path skips the Realm pool and gives
+every tenant an array-wide token. Test environments only — see
+[`flasharray-file-plan.md`](flasharray-file-plan.md).
+
+### Configuration
+
+Edit `flasharray.yaml` (management VIP, NFS VIP, export policy, NFS server)
+and export the array-wide token so it never lands in git:
+
+```bash
+export PURE_FA_API_TOKEN="$(< /tmp/fa-api-token)"
+```
+
+### Step 1 — Onboard the tenant
+
+```bash
+ansible-playbook tests/manual/pure/test_pure_flasharray.yml
+```
+
+Runs `setup` + `ensure_storage_class` through the dispatcher. The playbook
+asserts the hub Secret (`fa_file_system`, `pure-backend-type=flasharray`, no
+Realm label), the `FlashArrays` CSI Secret, and `backend: pure_fa_file`
+StorageClasses. No array API call is made at this step.
+
+### Step 2 — Point the standalone driver at the FlashArray
+
+The provisioner reads `px-pure-secret` / `pure-csi-credentials` from
+`osac-csi`; the role writes `pure-csi-secret-<backend-id>` for the
+StorageClass. Copy the payload into both namespaces:
+
+```bash
+PAYLOAD=$(kubectl -n osac-system get secret pure-csi-secret-be-pure-fa-test \
+  -o jsonpath='{.data.pure\.json}' | base64 -d)
+for ns in osac-csi osac-csi-backends; do
+  for name in pure-csi-credentials px-pure-secret; do
+    kubectl -n "$ns" create secret generic "$name" \
+      --from-literal=pure.json="$PAYLOAD" --dry-run=client -o yaml | kubectl apply -f -
+  done
+done
+kubectl -n osac-csi rollout restart ds/pure-csi-node
+kubectl -n osac-csi-backends rollout restart deploy/pure-csi-controller
+```
+
+If the driver is not installed yet, install it first:
+[`pure-csi-driver-installation.md`](pure-csi-driver-installation.md).
+
+### Step 3 — Create a PVC (Phase 0 decision point)
+
+```bash
+kubectl apply -f - <<EOF
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: pure-fa-test
+  namespace: osac-system
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: pure-nfs-test-pure-tenant-default
+  resources:
+    requests:
+      storage: 1Gi
+EOF
+
+kubectl -n osac-system get pvc pure-fa-test
+kubectl -n osac-csi-backends logs deploy/pure-csi-controller \
+  -c pure-csi-driver --tail=100
+```
+
+Outcome A: the array shows a new file system. Outcome B: a managed directory
+appeared inside `osac-test-pure-tenant` or provisioning failed because the
+file system is admin-provisioned. Record which one; it decides whether
+`pure_realm` must create the file system (see the plan).
+
+### Step 4 — Teardown
+
+```bash
+kubectl -n osac-system delete pvc pure-fa-test
+ansible-playbook tests/manual/pure/test_pure_flasharray_teardown.yml
+```
+
+The playbook removes StorageClasses, both Secrets and the hub Secret. Array
+resources (file system, API token) are not deleted.
+
+---
+
 ## Complete Test Workflow
 
 ### Setup Flow

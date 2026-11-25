@@ -136,6 +136,11 @@ Expect no changes. FA File is NFS over TCP; the protocol is identical: no `PURE_
 
 **Phase 0 alone may be all you need.** If the goal is just "verify a PVC works against an FA," it ends there — no AAP changes, no test churn.
 
+The AAP path is scripted: `flasharray.yaml` holds the non-secret inputs,
+`test_pure_flasharray.yml` runs setup + ensure_storage_class, and
+`test_pure_flasharray_teardown.yml` removes the cluster-side resources. Run
+order, driver credential sync and the PVC probe are in [`README.md`](README.md).
+
 **Phase 1 only earns its keep** if you want the full tenant onboarding flow driven by playbooks. For one-off testing, hand-written Secrets and StorageClasses (Phase 0 artifacts) are faster.
 
 ---
