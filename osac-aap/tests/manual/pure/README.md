@@ -225,6 +225,10 @@ the Default Array Server, and its Ethernet interface step creates the VIF.
 
 ### Configuration
 
+If `kubectl` reports `connection refused` on `127.0.0.1:<port>`, the kind API
+port rotated when the container restarted; refresh the context with
+`kind export kubeconfig --name osac-test`.
+
 Edit `flasharray.yaml` (management VIP, NFS VIP, export policy, parent file
 system) and export the array-wide token so it never lands in git:
 
