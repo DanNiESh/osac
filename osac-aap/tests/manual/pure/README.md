@@ -197,12 +197,16 @@ Configure these on the array first:
 |---|---|---|
 | File Services + Default Array Server | — | Storage → File Systems (File Services setup wizard) |
 | File VIF (NFS endpoint) | `test_fa_nfs_endpoint` | Settings → Network → Interfaces (service: File) |
-| Parent file system | `test_fa_file_system` | Storage → File Systems |
+| Parent file system (array root, not in a pod) | `test_fa_file_system` | Storage → File Systems |
 | NFS export policy | `test_fa_nfs_policy` | Storage → File Systems → Policies |
 | API token | `PURE_FA_API_TOKEN` | Settings → Users and Policies → API Tokens |
 
 The policy must allow the node networks and NFS v4.1 (the StorageClass asks for
-`nfsvers=4.1`); the array policy overrides `mountOptions`. Verify with:
+`nfsvers=4.1`); the array policy overrides `mountOptions`. If pods set
+`fsGroup` or change ownership, the policy needs `no_root_squash` and NFS User
+Mapping must be disabled, otherwise mounts fail with `permission denied` or
+`lchown failed`. A quota policy is optional but without one the PVC size is
+advisory — `df` in the pod reports the whole parent file system. Verify with:
 
 ```bash
 purefs list
@@ -263,7 +267,7 @@ metadata:
   name: pure-fa-test
   namespace: osac-system
 spec:
-  accessModes: [ReadWriteOnce]
+  accessModes: [ReadWriteMany]   # FA File Services supports RWX only
   storageClassName: pure-nfs-test-pure-tenant-default
   resources:
     requests:
@@ -315,7 +319,7 @@ metadata:
   name: pure-test-pvc
   namespace: osac-system
 spec:
-  accessModes: [ReadWriteOnce]
+  accessModes: [ReadWriteMany]   # FA File Services supports RWX only
   storageClassName: pure-nfs-test-pure-tenant-default
   resources:
     requests:
